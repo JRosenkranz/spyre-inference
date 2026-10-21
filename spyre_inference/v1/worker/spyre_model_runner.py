@@ -46,7 +46,7 @@ import torch.nn.functional as F
 from torch.utils._pytree import tree_map
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig
-from vllm.forward_context import BatchDescriptor
+from vllm.forward_context import BatchDescriptor, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
@@ -55,7 +55,9 @@ from vllm.model_executor.model_loader.utils import get_model_architecture
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.pooling_params import PoolingParams
+from vllm.sequence import IntermediateTensors
 from vllm.tasks import PoolingTask
+from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     KVConnectorOutput,
@@ -124,6 +126,7 @@ from spyre_inference.v1.worker.encoder_grid import (
     encoder_pad_token_id,
     expand_body_to_grid,
 )
+from spyre_inference.v1.worker.forward_timing import ForwardTiming
 from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
@@ -442,6 +445,7 @@ class _SpyreModelWrapper:
         *,
         model_dtype: torch.dtype,
         inputs_embeds_buffer: torch.Tensor | None = None,
+        forward_timing: ForwardTiming | None = None,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
@@ -451,6 +455,7 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_shape_bucketer", shape_bucketer)
         object.__setattr__(self, "_model_dtype", model_dtype)
         object.__setattr__(self, "_inputs_embeds_buffer", inputs_embeds_buffer)
+        object.__setattr__(self, "_forward_timing", forward_timing)
 
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64. Do not use int32:
@@ -469,7 +474,12 @@ class _SpyreModelWrapper:
         reset_llama4_scale_cache()
 
         t0 = time.time()
+        timing = self._forward_timing
+        if timing is not None:
+            timing.mark("forward_start_ns")
         result = self._model(*args_converted, **kwargs_converted)
+        if timing is not None:
+            timing.mark("body_host_return_ns")
 
         # Pooling: keep on Spyre. Generative: D2H for sampling.
         if not self._keep_outputs_on_device:
@@ -502,10 +512,15 @@ class _SpyreModelWrapper:
         The sampled-row count is not body-bucket padded, so padding it onto the warmed
         row buckets keeps the projection on shapes warmup compiled.
         """
+        timing = self._forward_timing
+        if timing is not None:
+            timing.head_start(hidden_states.shape[0])
         num_rows = hidden_states.shape[0]
         buckets = self._logits_row_buckets
         idx = bisect.bisect_left(buckets, num_rows)
         padded_rows = buckets[idx] if idx < len(buckets) else num_rows
+        if timing is not None:
+            timing.head_padding(padded_rows)
         if padded_rows != num_rows:
             hidden_states = F.pad(hidden_states, (0, 0, 0, padded_rows - num_rows))
 
@@ -514,6 +529,11 @@ class _SpyreModelWrapper:
 
         if padded_rows != num_rows and logits is not None:
             logits = logits[:num_rows]
+        if timing is not None:
+            if isinstance(logits, torch.Tensor) and logits.device.type == "cpu":
+                timing.mark("cpu_logits_ready_ns")
+            else:
+                timing.unsupported("compute_logits did not return a CPU tensor")
         return logits
 
     def embed_multimodal(self, **kwargs):
@@ -653,6 +673,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Store the real Spyre device before super().__init__ so that
         # _make_buffer can place .gpu tensors on Spyre directly.
         self._spyre_device = device
+        timing_dir = envs.SPYRE_FORWARD_TIMING_DIR
+        self._forward_timing = (
+            ForwardTiming(
+                timing_dir, vllm_config.parallel_config.rank, vllm_config.model_config.runner_type
+            )
+            if timing_dir
+            else None
+        )
 
         # Set by load_model: whether the pooler/classifier stay on Spyre.
         self._pooling_on_spyre = False
@@ -804,7 +832,45 @@ class TorchSpyreModelRunner(GPUModelRunner):
             shape_bucketer=bucketer,
             model_dtype=self._model_dtype(),
             inputs_embeds_buffer=self.inputs_embeds.gpu,
+            forward_timing=self._forward_timing,
         )
+
+    def execute_model(
+        self,
+        scheduler_output: SchedulerOutput,
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        timing = self._forward_timing
+        if timing is None or not timing.enabled:
+            return super().execute_model(scheduler_output, intermediate_tensors)
+        timing.scheduler = scheduler_output
+        error = None
+        try:
+            return super().execute_model(scheduler_output, intermediate_tensors)
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            timing.finish(error)
+            timing.scheduler = None
+
+    def _model_forward(self, *args, **kwargs):
+        timing = self._forward_timing
+        if timing is not None and timing.enabled and timing.scheduler is not None:
+            timing.begin(
+                self.input_batch, args, kwargs, lambda: get_forward_context().attn_metadata
+            )
+        result = super()._model_forward(*args, **kwargs)
+        if timing is not None and timing.pending is not None:
+            if (
+                not self.model._keep_outputs_on_device
+                and isinstance(result, torch.Tensor)
+                and result.device.type == "cpu"
+            ):
+                timing.mark("body_cpu_ready_ns")
+            else:
+                timing.unsupported("hidden states were retained on device or are not a CPU tensor")
+        return result
 
     @staticmethod
     def _model_has_spyre_fp8(model: nn.Module) -> bool:
