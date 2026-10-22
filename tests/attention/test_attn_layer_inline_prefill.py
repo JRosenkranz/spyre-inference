@@ -62,7 +62,9 @@ def _holder() -> attn_layer.SlotMapping:
 
 def test_only_fresh_prompt_steps_publish_the_mask(default_vllm_config, monkeypatch):
     holder = _holder()
-    monkeypatch.setattr(spyre_attn.attn_layer, "install", lambda layers: holder)
+    monkeypatch.setattr(
+        spyre_attn.attn_layer, "install", lambda layers: (holder, Mock(spec=["publish"]))
+    )
     pages = torch.arange(8, dtype=torch.int32).view(2, 4)
 
     def step(query_lens, seq_lens):
@@ -150,7 +152,7 @@ def test_fp8_cache_keeps_prefill_opaque(monkeypatch):
     layer.impl.staging_buffers = None
     layer.impl.do_kv_cache_update.return_value = torch.ones(1)
 
-    holder = attn_layer.install([layer])
+    holder, _ = attn_layer.install([layer])
     assert not holder.inline_prefill
     holder.publish_prefill([tokens], tokens)
     assert holder.prefill_mask is None
