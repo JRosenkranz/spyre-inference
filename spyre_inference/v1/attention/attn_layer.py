@@ -93,6 +93,7 @@ class SlotMapping:
         """
         if (
             query_lens is None
+            or sum(query_lens) != num_tokens
             or not self.inline_prefill
             or not 1 < num_tokens <= INLINE_PREFILL_MAX_TOKENS
             or has_kv_transfer_group()
@@ -270,6 +271,8 @@ def _inline_prefill_refusal(layer: Attention) -> str | None:
     impl = layer.impl
     if not getattr(impl, "_compile_attn", False):
         return "attention is eager, so there is no outer graph to fuse into"
+    if getattr(impl, "kv_cache_fp8", False):
+        return "FP8 attention must read the quantized cache"
     if envs.SPYRE_ATTN_MAX_CORES:
         return "SPYRE_ATTN_MAX_CORES caps every attention compile, which a block graph cannot scope"
     if getattr(impl, "alibi_slopes", None) is not None:
